@@ -2,7 +2,7 @@
 
 A machine learning regression project that predicts the **number of individuals in a household** based on Amazon purchasing behavior and survey data. The project compares multiple regression models (Lasso, Ridge, Regression Tree, Random Forest, XGBoost, GAM) and evaluates performance using **RMSE and MSE**.
 
-> Slides included: **Final Regression Report.docx**
+> Report included: **Final Regression Report.docx**
 
 ---
 
