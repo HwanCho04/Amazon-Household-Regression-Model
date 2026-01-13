@@ -1,0 +1,728 @@
+---
+title: "Stats 101C Regression Final Project"
+subtitle: "Final Model Selection"
+author: |
+  Alexander, Hwan, Martina, Ryan, April, Nathan
+date: "2025-12-04"
+output: 
+  pdf_document:
+    toc: true          
+    toc_depth: 3       
+    number_sections: true  
+fontsize: 11pt          
+geometry: margin=1in   
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(mlr3)
+library(mlr3pipelines)
+library(mlr3extralearners)
+library(randomForest)
+library(mlr3verse)
+```
+
+## Load Data
+
+```{r, warning = FALSE}
+survey <- read_csv("survey_train_test.csv")
+amazon_purchases <- read_csv("amazon-purchases.csv")
+```
+
+## Feature Engineering
+
+```{r}
+# Define categories that are child indicators
+child_indicators <- c(
+  # Strong baby signals
+  "ABIS_BABY_PRODUCT", "GUILD_BABY",
+  "BABY_BOTTLE", "BABY_FORMULA", "BABY_FOOD",
+  "BREAST_PUMP", "CRIB", "CHANGING_PAD", "CHANGING_TABLE", "BABY_CARRIER",
+  "PACIFIER", "TEETHER", "BABY_BATHTUB",
+  "BABY_JUMPER_WALKER", "BABY_SEAT", "PLAYARD",
+  "BOTTLE_NIPPLE", "BABY_PRODUCT", "INFANT_TODDLER_CAR_SEAT", "TOYS_AND_GAMES",
+  "COLORING_ITEM", "BASSINET", "SCHOOL_SUPPLIES", "PUZZLES", "BOARD_GAMES",
+
+  # Strong kid signals
+  "TOY_FIGURE", "TOY_FIGURE_PLAYSET",
+  "TOY_MODEL_VEHICLE_TRACK", "ABIS_TOY", "GUILD_TOYS_AND_GAMES",
+  "TOY_STROLLER", "TOY_SLIME", "MINIATURE_TOY_BUILDING",
+  "PLAY_SLIDE", "COLLAPSIBLE_PLAY_STRUCTURE",
+  "RIDE_ON_TOY", "PUSH_PULL_TOY", "KICK_SCOOTER",
+  "ROLLER_SKATE", "BICYCLE"
+)
+
+grocery_indicators <- c(
+    "GROCERY", "FOOD", "FRUIT", "VEGETABLE", "MEAT",
+  "POULTRY", "DAIRY", "BREAD", "SNACKS", "BREAKFAST_CEREAL",
+  "SPICES", "OILS", "DRINKS"
+)
+
+pet_indicators <- c(
+  "PET_FOOD", "PET_SUPPLIES", "PET_TOY"
+)
+
+household_indicators <- c("CHAIR", "TABLE", "DESK", "DRESSER", "COUCH", "SOFA",
+  "BOOKSHELF", "SHELF", "BED_FRAME", "NIGHTSTAND", "BAR_STOOL", "OFFICE_CHAIR", "TV_STAND", "PILLOW", "TOWEL", "BEDDING_SET", "FITTED_SHEET")
+
+amazon_by_user <- amazon_purchases |> 
+  group_by(`Survey ResponseID`) |> 
+  summarise(
+    log_total_purchase = log1p(sum(`Purchase Price Per Unit` * Quantity)),
+            avg_unit_price = mean(`Purchase Price Per Unit`),
+            avg_quantity = mean(Quantity),
+            unique_items = length(unique(`ASIN/ISBN (Product Code)`)),
+            unique_categories = length(unique(Category)),
+            orders = n(),
+            order_period_days = as.numeric(max(`Order Date`) - min(`Order Date`)),
+            order_frequency = as.numeric(max(unique(`Order Date`)) - min(unique(`Order Date`))) / length(unique(`Order Date`)),
+            order_frequency = as.numeric(max(unique(`Order Date`)) - min(unique(`Order Date`))) / length(unique(`Order Date`)),
+            log_orders_per_day = log1p(orders / pmax(order_period_days, 1)),
+            unique_states = length(unique(`Shipping Address State`)),
+            christmas_order_pct = mean(format(`Order Date`, "%m-%d") >= "11-28" & 
+                                   format(`Order Date`, "%m-%d") <= "12-26"),
+            bts_order_pct = mean(format(`Order Date`, "%m-%d") >= "07-20" & 
+                                   format(`Order Date`, "%m-%d") <= "09-10"),
+            child_indicator = any(Category %in% child_indicators),
+            log_child_quantity = log1p(sum(Quantity[Category %in% child_indicators], na.rm = TRUE)),
+            beds_quantity = sum(Quantity[Category %in% c("BED_FRAME", "BEDDING_SET")], na.rm = TRUE),
+            grocery_indicator = any(Category %in% grocery_indicators),
+            log_grocery_quantity = log1p(sum(Quantity[Category %in% grocery_indicators], na.rm = TRUE)),
+            pet_indicator = any(Category %in% pet_indicators),
+            log_pet_quantity = log1p(sum(Quantity[Category %in% pet_indicators], na.rm = TRUE)),
+            household_indicator = any(Category %in% household_indicators),
+            log_household_quantity = log1p(sum(Quantity[Category %in% household_indicators], na.rm = TRUE)),
+            most_ordered_day = names(which.max(table(weekdays(`Order Date`)))),
+            orders_weekend = sum(weekdays(`Order Date`) %in% c("Saturday", "Sunday")),
+            orders_weekday = sum(!weekdays(`Order Date`) %in% c("Saturday", "Sunday")), orders_mon = sum(weekdays(`Order Date`) == "Monday"),
+            orders_tues = sum(weekdays(`Order Date`) == "Tuesday"),
+            orders_wed = sum(weekdays(`Order Date`) == "Wednesday"),
+            orders_thur = sum(weekdays(`Order Date`) == "Thursday"),
+            orders_fri = sum(weekdays(`Order Date`) == "Friday"),
+            order_sat = sum(weekdays(`Order Date`) == "Saturday"),
+            orders_sun = sum(weekdays(`Order Date`) == "Sunday"),
+  )
+
+splits <- quantile(amazon_by_user$avg_quantity, probs = c(1/3, 2/3), na.rm = TRUE)
+
+amazon_by_user <- amazon_by_user |> 
+ mutate(low_avg_quantity = as.integer(avg_quantity <= splits[1]),
+         med_avg_quantity  = as.integer(avg_quantity > splits[1] & avg_quantity <= splits[2]),
+         high_avg_quantity = as.integer(avg_quantity > splits[2])
+  )
+
+
+head(amazon_by_user)
+
+
+```
+
+
+```{r}
+survey_subset <- survey[ , c("Survey.ResponseID", "Q.demos.gender", "Q.demos.state", "Q.amazon.use.hh.size.num", "test")]
+
+df <- amazon_by_user |> left_join(survey_subset, by = c("Survey ResponseID" = "Survey.ResponseID"))
+
+df$Q.demos.state = factor(df$Q.demos.state)
+df$Q.demos.gender = factor(df$Q.demos.gender)
+df$most_ordered_day = factor(df$most_ordered_day)
+
+
+# Create a subset of the test data
+df_train <- df[df$test == FALSE, c(-1, -ncol(df))]
+df_test <- df[df$test == TRUE, c(-1, -ncol(df))]
+
+# Store these for final outputs later
+response_ids <- df[df$test == TRUE, -ncol(df)]$`Survey ResponseID`
+```
+
+## Model Creation
+
+### Lasso
+
+```{r}
+set.seed(123)
+mod_mat <- model.matrix(~ ., data = df_train)[, -1]
+tsk_lasso <- as_task_regr(x = mod_mat, target = "Q.amazon.use.hh.size.num")
+lrn_lasso_cv <- lrn(
+    "regr.cv_glmnet", 
+    alpha = 1, 
+    s = "lambda.min",
+    nfolds = 10,
+    lambda = 10^seq(from = -2, to = 2, by = 0.1),
+    standardize = TRUE
+)
+cv_10fold <- rsmp("cv", folds = 10)
+resamp_lasso <- resample(task = tsk_lasso, learner = lrn_lasso_cv, resampling = cv_10fold)
+error_lasso_cv <- resamp_lasso$aggregate(msrs(c("regr.mse", "regr.rmse"), average = "micro"))
+error_lasso_cv
+```
+
+
+
+```{r}
+set.seed(123)
+lrn_lasso_cv$train(task = tsk_lasso)
+df_test <- df[df$test == TRUE, -ncol(df)]
+response_ids <- df_test$`Survey ResponseID`
+df_test <- df_test[ , -1]
+df_test_lasso <- model.matrix(~ ., data = df_test[ , setdiff(names(df_test), "Q.amazon.use.hh.size.num")])[, -1]
+
+tsk_test <- as_task_regr(cbind(df_test_lasso, Q.amazon.use.hh.size.num = df_test$Q.amazon.use.hh.size.num),
+                         target = "Q.amazon.use.hh.size.num")
+pred <- lrn_lasso_cv$predict(tsk_test)
+output <- data.frame(
+  Survey.ResponseID = response_ids,
+  Q.amazon.use.hh.size.num = pred$response
+)
+write.csv(output, "cv_lasso_predictions_final.csv", row.names = FALSE)
+```
+
+Plot cv tuning selection of lambda
+```{r}
+plot(lrn_lasso_cv$model, sign.lambda = 1)
+lrn_lasso_cv$model$lambda.min
+```
+#### Individual observation examples (highest and lowest predictions)
+
+```{r}
+min_pred <- min(pred$response)
+max_pred <- max(pred$response)
+
+# Convert model matrix to data frame with proper column names
+predictor_df <- as.data.frame(df_test_lasso)
+
+# Add Survey ResponseID and predicted response
+full_pred_df <- predictor_df %>%
+  mutate(
+    Survey.ResponseID = response_ids,
+    Predicted = pred$response
+  )
+
+head(full_pred_df)
+
+# min prediction R_111J2YLIGckNIeJ -- prediction 0.6133735
+full_pred_df[which.min(full_pred_df$Predicted), ]
+
+# max prediction R_3Kv8PUwM5KE3ZA2 -- prediction 3.905233
+full_pred_df[which.max(full_pred_df$Predicted), ]
+
+```
+
+
+
+
+
+```{r}
+table(df_train$Q.demos.state)
+exp(3.295837)
+```
+
+
+
+```{r}
+coefs <- coef(lrn_lasso_cv$model, s = "lambda.min")
+coefs <- as.matrix(coefs)
+
+coef_df <- tibble(
+  feature = rownames(coefs),
+  coef = coefs[,1]
+)
+
+# # How many of those variables are state categories
+# coef_df %>%
+#   filter(feature != "(Intercept)") %>%
+#   filter(coef == 0) %>%
+#   filter(str_detect(feature, "state"))
+
+coef_df <- coef_df %>%
+  filter(feature != "(Intercept)") %>%
+  filter(coef != 0) %>%
+  filter(!str_starts(feature, "Q.demos.state")) %>%
+  mutate(abs_coef = abs(coef)) %>%
+  arrange(desc(abs_coef)) # %>% 
+  # slice(1:20) # comment out to show all non-zero features
+
+ggplot(coef_df, aes(x = reorder(feature, abs_coef), y = coef, fill = coef > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "green", "FALSE" = "red"),
+                    labels = c("Negative", "Positive")) +
+  labs(
+    title = "Top Lasso Features by Importance Without States",
+    x = "Feature",
+    y = "Coefficient",
+    fill = "Direction"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+
+### Ridge
+
+```{r}
+set.seed(123)
+mod_mat <- model.matrix(~ ., data = df_train)[, -1]
+tsk_ridge <- as_task_regr(x = mod_mat, target = "Q.amazon.use.hh.size.num")
+lrn_ridge_cv <- lrn(
+    "regr.cv_glmnet", 
+    alpha = 0, 
+    s = "lambda.min",
+    nfolds = 10,
+    lambda = 10^seq(from = -2, to = 2, by = 0.1),
+    standardize = TRUE
+)
+cv_10fold <- rsmp("cv", folds = 10)
+resamp_ridge <- resample(task = tsk_ridge, learner = lrn_ridge_cv, resampling = cv_10fold)
+error_ridge_cv <- resamp_ridge$aggregate(msrs(c("regr.mse", "regr.rmse"), average = "micro"))
+error_ridge_cv
+```
+
+```{r}
+set.seed(123)
+lrn_ridge_cv$train(task = tsk_ridge)
+df_test <- df[df$test == TRUE, -ncol(df)]
+response_ids <- df_test$`Survey ResponseID`
+df_test <- df_test[ , -1]
+df_test_ridge <- model.matrix(~ ., data = df_test[ , setdiff(names(df_test), "Q.amazon.use.hh.size.num")])[, -1]
+
+tsk_test <- as_task_regr(cbind(df_test_ridge, Q.amazon.use.hh.size.num = df_test$Q.amazon.use.hh.size.num),
+                         target = "Q.amazon.use.hh.size.num")
+pred <- lrn_ridge_cv$predict(tsk_test)
+output <- data.frame(
+  Survey.ResponseID = response_ids,
+  Q.amazon.use.hh.size.num = pred$response
+)
+write.csv(output, "cv_ridge_predictions_final.csv", row.names = FALSE)
+```
+
+```{r}
+coefs_ridge <- coef(lrn_ridge_cv$model, s = "lambda.min")
+coefs_ridge <- as.matrix(coefs_ridge)
+
+ridge_df <- tibble(
+  feature = rownames(coefs_ridge),
+  coef = coefs_ridge[,1]
+) %>%
+  filter(feature != "(Intercept)") %>%
+  filter(!str_starts(feature, "Q.demos.state")) %>%
+  mutate(abs_coef = abs(coef)) %>%
+  arrange(desc(abs_coef)) %>%
+  head(30)
+
+ggplot(ridge_df, aes(x = reorder(feature, abs_coef), y = coef, color = coef > 0)) +
+  geom_point(size = 3) +
+  coord_flip() +
+  scale_color_manual(values = c("TRUE" = "green", "FALSE" = "red"),
+                     labels = c("Negative", "Positive")) +
+  labs(
+    title = "Ridge Regression Coefficient Magnitudes",
+    x = "Feature",
+    y = "Coefficient",
+    color = "Direction"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+lrn_ridge_cv$model$lambda.min
+plot(lrn_ridge_cv$model)
+title("Ridge Regression Cross-Validation Curve")
+```
+
+
+
+
+
+### GAM
+
+```{r}
+set.seed(123)
+tsk_household_num <- as_task_regr(df_train, target = "Q.amazon.use.hh.size.num")
+
+# Create the gam formula for a natural cubic spline
+numeric_vars <- names(df_train)[sapply(df_train, is.numeric)]
+numeric_vars <- setdiff(numeric_vars, "Q.amazon.use.hh.size.num")
+
+make_s_term <- function(var, data, k_max = 10) {
+  u <- length(unique(data[[var]]))
+  k_use <- min(k_max, u - 1)
+  if (k_use < 3) {
+    return(var)
+  }
+  
+  paste0("s(", var, ", bs = 'cr', k = ", k_use, ")")
+}
+
+spline_terms <- sapply(numeric_vars, make_s_term, data = df_train)
+
+gam_formula <- as.formula(paste("Q.amazon.use.hh.size.num ~", spline_terms))
+
+lrn_gam <- as_learner(
+  po("fixfactors") %>>%
+  po("encode", method = "one-hot") %>>%
+  po("imputeoor") %>>%
+  lrn("regr.gam",
+      formula = gam_formula)
+)
+
+cv_10fold <- rsmp("cv", folds = 10)
+resamp_gam <- resample(task = tsk_household_num, learner = lrn_gam, resampling = cv_10fold)
+error_gam <- resamp_gam$aggregate(measures = msrs(c("regr.mse", "regr.rmse"), average = "micro"))
+error_gam
+```
+
+
+```{r}
+set.seed(123)
+
+df_test <- df[df$test == TRUE, -ncol(df)]
+response_ids <- df_test$`Survey ResponseID`
+df_test <- df_test[ , -1]
+
+lrn_gam$train(task = tsk_household_num)
+
+pred <- lrn_gam$predict_newdata(df_test)
+
+output <- data.frame(
+  Survey.ResponseID = response_ids,
+  Q.amazon.use.hh.size.num = pred$response
+)
+
+write.csv(output, "gam_cubic_splines_predictions_final.csv", row.names = FALSE)
+
+```
+
+### Regression Tree
+
+```{r}
+tsk_household_num <- as_task_regr(df_train, target = "Q.amazon.use.hh.size.num")
+
+
+# Vanilla Regression Tree
+
+regr_tree <- lrn("regr.rpart")
+regr_tree$train(tsk_household_num)
+regr_tree$model
+
+regr_tree$model |> rpart.plot::rpart.plot()
+
+set.seed(101)
+
+cv_10fold <- rsmp("cv", folds = 10)
+resamp_regrtree <- resample(task = tsk_household_num, learner = regr_tree, resampling = cv_10fold)
+error_regrtree <- resamp_regrtree$aggregate(measures = msrs(c("regr.mse", "regr.rmse"), average = "micro"))
+
+error_regrtree 
+
+# Tuned Regression Tree
+
+library(mlr3tuning)
+
+lrn_rpart <- lrn("regr.rpart", 
+                 maxdepth = to_tune(),
+                 minsplit = to_tune(2, 100, logscale = TRUE))
+
+set.seed(101)
+instance <- ti(task = tsk_household_num, learner = lrn_rpart, resampling = rsmp("cv", folds = 10),
+               measures = msr("regr.rmse"), terminator = trm("none"))
+
+tuner = tnr("grid_search", resolution = 10)
+tuner$optimize(inst = instance)
+
+instance$result
+
+lrn_rpart_tuned <- lrn("regr.rpart")
+lrn_rpart_tuned$param_set$values <- instance$result_learner_param_vals
+
+lrn_rpart_tuned$train(tsk_household_num)
+lrn_rpart_tuned$model |> rpart.plot::rpart.plot()
+
+cv_10fold <- rsmp("cv", folds = 10)
+resamp_regrtree_tuned <- resample(task = tsk_household_num, learner = lrn_rpart_tuned, resampling = cv_10fold)
+error_regrtree_tuned <- resamp_regrtree_tuned$aggregate(measures = msrs(c("regr.mse", "regr.rmse"), average = "micro"))
+
+error_regrtree 
+error_regrtree_tuned # tuned is better 
+
+```
+
+
+```{r}
+set.seed(123)
+df_test <- df[df$test == TRUE,  -ncol(df)]
+df_test
+
+
+tsk_test <- as_task_regr(df_test, target = "Q.amazon.use.hh.size.num")
+pred <- regr_tree$predict_newdata(df_test)
+pred2 <- lrn_rpart_tuned$predict_newdata(df_test)
+
+output <- data.frame(
+  Survey.ResponseID = df_test$`Survey ResponseID`,
+  Q.amazon.use.hh.size.num = pred$response
+)
+
+output2 <- data.frame(
+  Survey.ResponseID = df_test$`Survey ResponseID`,
+  Q.amazon.use.hh.size.num = pred2$response
+)
+
+write.csv(output, "regressiontree_predictions_final.csv", row.names = FALSE)
+write.csv(output, "tuned_regressiontree_predictions_final.csv", row.names = FALSE)
+```
+
+
+
+### Random Forest
+
+```{r}
+library(data.table)
+library(mlr3learners)
+library(mlr3tuning)
+
+tsk_household_num <- as_task_regr(df_train, target = "Q.amazon.use.hh.size.num")
+
+# Vanilla Random Forest
+regr_rf <- lrn("regr.ranger", importance = "permutation")
+regr_rf$train(task = tsk_household_num)
+regr_rf$model
+
+importance_scores <- regr_rf$model$model$variable.importance
+
+
+df_imp <- data.frame(
+  var = names(importance_scores),
+  value = importance_scores
+)
+
+
+ggplot(df_imp, aes(x = value, y = reorder(var, value))) +
+  geom_point() +
+  ylab("Variable") +
+  xlab("Importance") +
+  ggtitle("Random Forest Variable Importance")
+
+
+set.seed(101)
+
+cv_10fold <- rsmp("cv", folds = 10)
+resamp_rf <- resample(task = tsk_household_num, learner = regr_rf, resampling = cv_10fold)
+error_rf <- resamp_rf$aggregate(measures = msrs(c("regr.mse", "regr.rmse"), average = "micro"))
+
+
+error_rf
+
+# Include Trash Variable
+
+set.seed(101)
+
+tsk_household_num$cbind(data = data.frame(TRASH = rnorm(n = tsk_household_num$nrow)))
+regr_rf$train(task = tsk_household_num)
+
+importance_scores <- regr_rf$model$model$variable.importance
+
+
+df_imp <- data.frame(
+  var = names(importance_scores),
+  value = importance_scores
+)
+
+
+ggplot(df_imp, aes(x = value, y = reorder(var, value))) +
+  geom_point() +
+  ylab("Variable") +
+  xlab("Importance") +
+  ggtitle("Random Forest Variable Importance with Trash variable")
+
+
+# we see that variables like med_avg_quantity, low_avg_quantity, high_avg quantity, most_ordered_day, gender, grocery_indicator have an importance based on only chance
+
+# Tuned Random Forest
+
+
+lrn_rf <- lrn("regr.ranger",
+              mtry = floor(tsk_household_num$ncol / 3),
+              min.node.size = to_tune(1, 50),
+              max.depth = to_tune(2, 10)
+              )
+
+tsk_household_num$ncol
+
+set.seed(101)
+tune_rf <- auto_tuner(
+  tuner = tnr("grid_search", resolution = 4),
+  learner = lrn_rf,
+  resampling = rsmp("cv", folds = 5),
+  measure = msr("regr.rmse")
+)
+
+tune_rf$train(task = tsk_household_num)
+
+lrn_rf_tuned <- tune_rf$learner
+
+set.seed(101)
+
+cv_10fold <- rsmp("cv", folds = 10)
+resamp_rf_tuned <- resample(task = tsk_household_num, learner = lrn_rf_tuned, resampling = cv_10fold)
+error_rf_tuned <- resamp_rf_tuned$aggregate(measures = msrs(c("regr.mse", "regr.rmse"), average = "micro"))
+error_rf_tuned
+
+```
+
+
+
+
+```{r}
+
+df_test <- df[df$test == TRUE,  -ncol(df)]
+df_test
+
+tsk_household_num$select(setdiff(tsk_household_num$feature_names, "TRASH"))
+regr_rf <- lrn("regr.ranger", importance = "permutation")
+set.seed(123)
+regr_rf$train(task = tsk_household_num)
+lrn_rf_tuned$train(task = tsk_household_num)
+tsk_test <- as_task_regr(df_test, target = "Q.amazon.use.hh.size.num")
+pred <- regr_rf$predict_newdata(df_test)
+pred2 <- lrn_rf_tuned$predict_newdata(df_test)
+
+
+output <- data.frame(
+  Survey.ResponseID = df_test$`Survey ResponseID`,
+  Q.amazon.use.hh.size.num = pred$response
+)
+
+output2 <- data.frame(
+  Survey.ResponseID = df_test$`Survey ResponseID`,
+  Q.amazon.use.hh.size.num = pred2$response
+)
+
+write.csv(output, "random_forest_predictions_final.csv", row.names = FALSE)
+write.csv(output2, "tuned_random_forest_predictions_final.csv", row.names = FALSE)
+```
+
+
+### XGBoost
+
+```{r}
+library(data.table)
+library(mlr3extralearners)
+library(mlr3learners)
+library(mlr3tuning)
+
+# Vanilla XG Boost
+
+set.seed(101)
+
+xg_boost_df <- df_train %>%
+  mutate(across(where(is.character), as.factor))
+
+tsk_household_num <- as_task_regr(xg_boost_df, target = "Q.amazon.use.hh.size.num")
+
+regr_xgboost <- as_learner(po("encode", method = "one-hot") %>>% lrn("regr.xgboost"))
+regr_xgboost$train(task = tsk_household_num)
+regr_xgboost$model
+
+
+cv_10fold <- rsmp("cv", folds = 10)
+resamp_xgboost <- resample(task = tsk_household_num, learner = regr_xgboost, resampling = cv_10fold)
+error_xgboost <- resamp_xgboost$aggregate(measures = msrs(c("regr.mse", "regr.rmse"), average = "micro"))
+error_xgboost
+
+# Tuned XG Boost
+
+set.seed(101)
+
+lrn_xgboost <- as_learner(po("encode", method = "one-hot") %>>%
+                            lrn("regr.xgboost",
+                                eta = to_tune(1e-4, 1, logscale = TRUE),
+                                max_depth = to_tune(1,20),
+                                colsample_bytree = to_tune(1e-1, 1),
+                                colsample_bylevel = to_tune(1e-1, 1),
+                                lambda = to_tune(1e-3, 1e3, logscale = TRUE),
+                                alpha = to_tune(1e-3, 1e3, logscale = TRUE),
+                                subsample = to_tune(1e-1, 1)
+                                ))
+
+# New proposed tuning (ended up worse)
+
+# lrn_xgboost <- as_learner(po("encode", method = "one-hot") %>>%
+#   lrn("regr.xgboost",
+#       eta = to_tune(0.01, 0.3),
+#       max_depth = to_tune(3, 10),
+#       subsample = to_tune(0.5, 1),
+#       colsample_bytree = to_tune(0.5, 1),
+#       lambda = to_tune(1e-2, 10, logscale = TRUE)
+#   ))
+
+
+at_xgb <- auto_tuner(
+  tuner = tnr("random_search"),
+  term_evals = 500,
+  learner = lrn_xgboost,
+  resampling = rsmp("holdout"),
+  measure = msr("regr.rmse")
+)
+
+# 300 models tested, so takes like 1 hour to run
+household_split <- partition(task = tsk_household_num, ratio = 0.67)
+at_xgb$train(tsk_household_num, row_ids = household_split$train)
+
+at_xgb_preds <- at_xgb$predict(tsk_household_num, row_ids = household_split$test)
+at_xgb_preds$score(msr("regr.rmse"))
+
+best_xgb <- at_xgb$learner$clone(deep = TRUE)
+best_xgb$train(tsk_household_num)
+
+```
+
+
+
+```{r}
+set.seed(123)
+df_test <- df[df$test == TRUE,  -ncol(df)]
+
+tsk_test <- as_task_regr(df_test, target = "Q.amazon.use.hh.size.num")
+
+pred1 <- regr_xgboost$predict_newdata(df_test)
+pred2 <- best_xgb$predict_newdata(df_test)
+
+
+output1 <- data.frame(
+  Survey.ResponseID = df_test$`Survey ResponseID`,
+  Q.amazon.use.hh.size.num = pred1$response
+)
+
+output2 <- data.frame(
+  Survey.ResponseID = df_test$`Survey ResponseID`,
+  Q.amazon.use.hh.size.num = pred2$response
+)
+
+write.csv(output1, "xgb_predictions_final.csv", row.names = FALSE)
+write.csv(output2, "tuned_xgb_predictions_final.csv", row.names = FALSE)
+```
+
+```{r}
+
+booster <- best_xgb$model$regr.xgboost$learner$model
+library(xgboost)
+importance_df <- xgb.importance(model = booster)
+
+importance_top30 <- importance_df |> 
+  dplyr::arrange(desc(Gain)) |> 
+  dplyr::slice(1:30)
+
+ggplot(importance_top30,
+       aes(x = Gain, y = reorder(Feature, Gain))) +
+  geom_col(fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    title = "Variable Importance Plot (Top 30)",
+    x = "Gain",
+    y = "Feature"
+  )
+```
+
+

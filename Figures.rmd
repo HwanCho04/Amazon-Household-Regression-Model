@@ -1,0 +1,303 @@
+---
+title: "Stats 101C Regression Final Project"
+subtitle: "Predicting Household Size using Consumer Data"
+author: |
+  Alexander, Hwan, Martina, Ryan, April
+date: "2025-12-04"
+output: 
+  pdf_document:
+    toc: true          
+    toc_depth: 3       
+    number_sections: true  
+fontsize: 11pt          
+geometry: margin=1in    
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(mlr3)
+# library(mlr3extralearners)
+library(randomForest)
+
+survey <- read_csv("survey_train_test.csv")
+amazon_purchases <- read_csv("amazon-purchases.csv")
+```
+
+# Introduction
+
+Our presentation is on predicting household members.
+
+# EDA
+
+```{r}
+survey_train = survey[survey$test == FALSE, ]
+head(survey)_train)
+```
+
+## Transformation of Variables
+
+### Feature Engineering
+
+```{r}
+# Define categories that are child indicators
+child_indicators <- c(
+  # Strong baby signals
+  "BABY_PRODUCT", "ABIS_BABY_PRODUCT", "GUILD_BABY",
+  "BABY_BOTTLE", "BABY_FORMULA", "BABY_FOOD",
+  "BREAST_PUMP", "CRIB", "CHANGING_PAD", "CHANGING_TABLE",
+  "INFANT_TODDLER_CAR_SEAT", "BABY_CARRIER",
+  "PACIFIER", "TEETHER", "BABY_BATHTUB",
+  "BABY_JUMPER_WALKER", "BABY_SEAT", "PLAYARD",
+  "BOTTLE_NIPPLE",
+
+  # Strong kid signals
+  "TOYS_AND_GAMES", "TOY_FIGURE", "TOY_FIGURE_PLAYSET",
+  "TOY_MODEL_VEHICLE_TRACK", "ABIS_TOY", "GUILD_TOYS_AND_GAMES",
+  "TOY_STROLLER", "TOY_SLIME", "MINIATURE_TOY_BUILDING",
+  "PLAY_SLIDE", "COLLAPSIBLE_PLAY_STRUCTURE",
+  "RIDE_ON_TOY", "PUSH_PULL_TOY", "KICK_SCOOTER",
+  "ROLLER_SKATE", "BICYCLE"
+)
+
+amazon_by_user <- amazon_purchases |> 
+  group_by(`Survey ResponseID`) |> 
+  summarise(total_purchase_amount = sum(`Purchase Price Per Unit` * Quantity),
+            avg_unit_price = mean(`Purchase Price Per Unit`),
+            avg_quantity = mean(`Quantity`),
+            unique_items = length(unique(`ASIN/ISBN (Product Code)`)),
+            unique_categories = length(unique(Category)),
+            order_frequency = as.numeric(max(unique(`Order Date`)) - min(unique(`Order Date`))) / length(unique(`Order Date`)),
+            order_period_days = as.numeric(max(unique(`Order Date`)) - min(unique(`Order Date`))),
+            orders = length(`Purchase Price Per Unit`),
+            unique_states = length(unique(`Shipping Address State`)),
+            bts_order_pct = mean(format(`Order Date`, "%m-%d") >= "07-20" & 
+                                   format(`Order Date`, "%m-%d") <= "09-10"),
+            christmas_order_pct = mean(format(`Order Date`, "%m-%d") >= "12-01" & 
+                                   format(`Order Date`, "%m-%d") <= "12-26"),
+            child_indicator = any(Category %in% child_indicators),
+            orders_weekday = sum(!weekdays(`Order Date`) %in% c("Saturday", "Sunday")),
+            orders_weekend = sum(weekdays(`Order Date`) %in% c("Saturday", "Sunday")),
+            most_ordered_day = names(which.max(table(weekdays(`Order Date`)))),
+            orders_mon = sum(weekdays(`Order Date`) == "Monday"),
+            orders_tues = sum(weekdays(`Order Date`) == "Tuesday"),
+            orders_wed = sum(weekdays(`Order Date`) == "Wednesday"),
+            orders_thur = sum(weekdays(`Order Date`) == "Thursday"),
+            orders_fri = sum(weekdays(`Order Date`) == "Friday"),
+            order_sat = sum(weekdays(`Order Date`) == "Saturday"),
+            orders_sun = sum(weekdays(`Order Date`) == "Sunday"),
+            orders_jan = sum(format(`Order Date`, "%m") == "01"),
+            orders_feb = sum(format(`Order Date`, "%m") == "02"),
+            orders_mar = sum(format(`Order Date`, "%m") == "03"),
+            orders_apr = sum(format(`Order Date`, "%m") == "04"),
+            orders_may = sum(format(`Order Date`, "%m") == "05"),
+            orders_jun = sum(format(`Order Date`, "%m") == "06"),
+            orders_jul = sum(format(`Order Date`, "%m") == "07"),
+            orders_aug = sum(format(`Order Date`, "%m") == "08"),
+            orders_sep = sum(format(`Order Date`, "%m") == "09"),
+            orders_oct = sum(format(`Order Date`, "%m") == "10"),
+            orders_nov = sum(format(`Order Date`, "%m") == "11"),
+            orders_dec = sum(format(`Order Date`, "%m") == "12")
+            )
+
+splits <- quantile(amazon_by_user$avg_quantity, probs = c(1/3, 2/3), na.rm = TRUE)
+
+amazon_by_user <- amazon_by_user |> 
+  mutate(low_avg_quantity = as.integer(avg_quantity <= splits[1]),
+         med_avg_quantity  = as.integer(avg_quantity > splits[1] & avg_quantity <= splits[2]),
+         high_avg_quantity = as.integer(avg_quantity > splits[2])
+  )
+
+head(amazon_by_user)
+```
+
+
+```{r}
+survey_subset <- survey[ , c("Survey.ResponseID", "Q.demos.gender", "Q.demos.state", "Q.amazon.use.hh.size.num", "test")]
+
+df <- amazon_by_user |> left_join(survey_subset, by = c("Survey ResponseID" = "Survey.ResponseID"))
+```
+
+```{r}
+df
+```
+
+
+## Visualizations
+
+### Back to School Order Percentage
+
+```{r}
+ggplot(data = df_train, mapping = aes(x = bts_order_pct, y = factor(Q.amazon.use.hh.size.num))) +
+  geom_boxplot() +
+  labs(main = "Household Size and Total Purchase Amount")
+```
+
+
+### Household size and Total Orders
+
+```{r}
+ggplot(data = df_train, mapping = aes(x = total_purchase_amount, y = Q.amazon.use.hh.size.num)) +
+  geom_point() +
+  labs(main = "Household Size and Total Purchase Amount")
+```
+```{r}
+ggplot(data = df_train, mapping = aes(x = order_frequency, y = factor(Q.amazon.use.hh.size.num), color = total_purchase_amount)) + 
+  geom_boxplot() +
+  labs(main = "Household Size and Order Frequency")
+```
+```{r}
+ggplot(data = df_train, mapping = aes(x = unique_items, y = factor(Q.amazon.use.hh.size.num))) +
+  geom_boxplot() +
+  labs(main = "Household Size and Unique Items Ordered")
+```
+
+
+
+
+```{r}
+
+library(maps)
+
+states <- map_data("state")
+
+# plot_df <- states %>% left_join(survey_train, by = c("Q.demos.state", ))
+
+# ggplot(states, aes(long, lat, group = group)) +
+#   geom_polygon(fill = "white", color = "black") +
+#   coord_fixed(1.3) +
+#   labs(title = "Map of the United States") +
+#   theme_minimal()
+
+avg_hh_map <- survey_train |>
+  mutate(
+    state = tolower(Q.demos.state)
+  ) |>
+  group_by(state) |>
+  summarise(
+    avg_hh_size = mean(Q.amazon.use.hh.size.num, na.rm = TRUE),
+    n = n()
+  )
+
+plot_df <- states |>
+  left_join(avg_hh_map, by = c("region" = "state"))
+
+ggplot(plot_df, aes(long, lat, group = group, fill = avg_hh_size)) +
+  geom_polygon(color = "black") +
+  coord_fixed(1.3) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    name = "Avg Household Size"
+  ) +
+  labs(
+    title = "Average Household Size by State",
+    subtitle = "Based on survey data"
+  ) +
+  theme_minimal()
+```
+
+
+### Visualization of Total Orders per User
+
+```{r}
+ggplot(data = amazon_by_user, mapping = aes(orders)) +
+  geom_histogram() +
+  labs(title = "Number of Orders per User")
+```
+
+### Average Time Between Orders
+
+```{r}
+ggplot(data = amazon_by_user, mapping = aes(order_frequency)) +
+  geom_histogram() +
+  labs(title = "Average Number of Days Between Orders per User")
+```
+
+### Average Number of States
+
+```{r}
+ggplot(data = amazon_by_user, mapping = aes(unique_states)) +
+  geom_bar() +
+  labs(title = "Average Number of States Shipped To")
+
+```
+
+### Average Number of Days Between Orders
+
+```{r}
+ggplot(data = amazon_by_user, mapping = aes(order_period_days)) +
+  geom_histogram() +
+  labs(title = "Average Number of Days Between Orders")
+```
+
+```{r}
+
+library(ggplot2)
+
+# Income vs Household Size
+
+# sum(is.na(df_train$Q.demos.income)) # 702 NA values
+
+df_train$Q.demos.income <- factor(df_train$Q.demos.income, levels = c("Less than $25,000", "$25,000 - 49,999", "$50,000 - $74,999", "$75,000 - $99,999", "$100,000 - $149,999", "$150,000 or more", "Prefer not to say"), ordered = TRUE)
+
+ggplot(df_train, aes(x = Q.demos.income, y = Q.amazon.use.hh.size.num)) +
+  geom_violin(fill = "forestgreen", alpha = 0.5) +
+  geom_jitter(width = 0.2, alpha = 0.25, color = "#2C3E50") +
+  labs(
+    title = "Distribution of Household Size Across Income Categories",
+    x = "Income Category",
+    y = "Household Size"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+# Age vs Household Size
+
+#sum(is.na(df_train$Q.demos.age)) # no NA values
+
+df_train$Q.demos.age <- factor(df_train$Q.demos.age, levels = c("18 - 24 years", "25 - 34 years", "35 - 44 years", "45 - 54 years", "55 - 64 years", "65 and older"), ordered = TRUE)
+
+ggplot(df_train, aes(x = Q.demos.age, y = Q.amazon.use.hh.size.num)) +
+  geom_violin(fill = "lightblue", alpha = 0.5) +
+  geom_jitter(width = 0.2, alpha = 0.25, color = "#2C3E50") +
+  labs(
+    title = "Distribution of Household Size Across Age Categories",
+    x = "Age Category",
+    y = "Household Size"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+# how often do you use Amazon vs Household Size
+
+# sum(is.na(df_train$Q.amazon.use.how.oft)) # no NA values
+
+df_train$Q.amazon.use.how.oft <- factor(df_train$Q.amazon.use.how.oft, levels = c("Less than 5 times per month", "5 - 10 times per month", "More than 10 times per month"), ordered = TRUE)
+
+ggplot(df_train, aes(x = Q.amazon.use.how.oft, y = Q.amazon.use.hh.size.num)) +
+  geom_violin(fill = "#9B59B6", alpha = 0.5) +
+  geom_jitter(width = 0.2, alpha = 0.25, color = "#2C3E50") +
+  labs(
+    title = "Distribution of Household Size Across how often you login on Amazon",
+    x = "How often do you (and anyone you shared account with)",
+    y = "Household Size"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+# sum(is.na(df_train$Q.demos.race)) # no NA
+
+# Race vs Household Size
+ggplot(df_train, aes(x = Q.demos.race, y = Q.amazon.use.hh.size.num)) +
+  geom_violin(fill = "#9B59B6", alpha = 0.5) +
+  geom_jitter(width = 0.2, alpha = 0.25, color = "#2C3E50") +
+  labs(
+    title = "Distribution of Household Size Across how often you login on Amazon",
+    x = "Race)",
+    y = "Household Size"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
