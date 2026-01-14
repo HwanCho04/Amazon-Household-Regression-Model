@@ -1,6 +1,5 @@
 ---
-title: "Stats 101C Regression Final Project"
-subtitle: "Predicting Household Size using Consumer Data"
+title: "Predicting Household Size using Consumer Data"
 author: |
   Alexander, Hwan, Martina, Ryan, April
 date: "2025-12-04"
