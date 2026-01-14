@@ -1,8 +1,6 @@
 ---
-title: "Stats 101C Regression Final Project"
-subtitle: "Final Model Selection"
-author: |
-  Alexander, Hwan, Martina, Ryan, April, Nathan
+title: "Final Model Selection"
+author: Hwan
 date: "2025-12-04"
 output: 
   pdf_document:
