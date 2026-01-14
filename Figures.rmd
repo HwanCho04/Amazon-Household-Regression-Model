@@ -1,7 +1,6 @@
 ---
 title: "Predicting Household Size using Consumer Data"
-author: |
-  Alexander, Hwan, Martina, Ryan, April
+author: Hwan
 date: "2025-12-04"
 output: 
   pdf_document:
